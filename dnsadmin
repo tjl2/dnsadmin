@@ -1,0 +1,1703 @@
+#! /usr/bin/python
+# dnsadmin - a script to control BIND record
+# zone.py should be copied to /usr/lib/python
+# dnsadmin.conf should be copied to /etc/dnsadmin
+# recordtemplates.py should be copied to /etc/dnsadmin, with a symlink to this
+# created in /usr/lib/python
+
+# Version 0.1
+# 2006-06-29
+# Copyright Tim Littlemore (tim@tjl2.com)
+
+from ConfigParser import ConfigParser
+from optparse import OptionParser
+from zone import *
+from recordtemplates import *
+import grp
+import os
+import pwd
+import re
+import stat
+import sys
+import time
+
+def main():
+    # This program can only be run by root, check for that before anything else.
+    if os.getuid() != 0:
+        print "You must be root to use dnsadmin."
+        sys.exit(1)
+    
+    usage = """%prog [OPTIONS] COMMAND [SOURCE[:PREF]] ZONE [IP] [TARGET]
+Commands:
+    zone       - add a ZONE. This command requires the IP 
+                 address to be provided
+    edit       - edit a ZONE
+    edit-ptr   - edit the PTR zone for IP
+    del        - delete a ZONE
+    delete     - as above
+    ptr        - create PTR record, pointing IP to HOSTNAME
+    import     - run the zone import process
+    sub        - add a subdomain for SOURCE to ZONE, using this nameserver
+                 and creating a new zone pointing all template A records
+                 to IP
+    ip-change  - batch change an IP address in all zones to a new IP address
+    
+    a          - add an A record to ZONE, pointing SOURCE to IP. SOURCE can have
+                 an optional TTL provided by prepending the SOURCE with TTL:
+    cname      - add a CNAME record to ZONE, pointing SOURCE to TARGET
+    mx         - add an MX record to ZONE, setting SOURCE:PREF to TARGET
+    ns         - add an NS record to ZONE, setting SOURCE to use TARGET
+                 nameserver
+    
+    ttl-zone   - change the ttl of a zone (time in seconds or using h, m, d, etc)
+    ttl-ip     - batch change the TTL on zones matching an IP address
+    serial     - update the serial of a zone (useful if the zone file has been
+                 manually modified)
+
+
+Examples:
+    dnsadmin zone test.com 123.123.123.123
+      - creates a new zone, test.com and sets up records
+      from the record templates file all pointing to
+      123.123.123.123 where relevant
+    dnsadmin ptr 10.0.0.10 www.test.net
+      - adds a PTR record for 10.0.0.10, pointing to
+      www.test.net
+    dnsadmin a www test.co.uk 111.111.111.111
+      - adds an A record www.test.co.uk to the test.co.uk
+      zone, pointing to 111.111.111.111
+    dnsadmin --ttl=0 a www test.net 192.168.0.150
+      - adds an A record www.test.net to the test.co.uk zone,
+      with a TTL of 0 seconds, pointing to 192.168.0.150
+    dnsadmin mx @:30 test.info external-mailserver.net.
+      - adds an MX record with preference 30 to the
+      test.info zone, routing mail to external-mailserver.net
+      (NOTE: if stating a full hostname as the TARGET,
+      make sure that it ends with a '.', as would be the
+      case if directly modifying the zone file)
+    dnsadmin sub secure test.biz 210.210.120.120
+      - adds appropriate NS records to the test.biz zone
+      and creates new secure.test.biz zone, with template
+      records pointing to 210.210.120.120
+    dnsadmin ip-change 192.168.0.10 10.0.0.20 -x test.com,test.net
+      - goes through all zone files, changing any references
+      to 192.168.0.10 to 10.0.0.20, but excluding test.com and
+      test.net from the changes
+    dnsadmin ttl-ip 5m 123.123.123.123
+      - changes the TTL to 5m in all zone files which reference
+      IP address 123.123.123.123 (useful to use before ip-change
+      command)
+    dnsadmin ttl-zone 3h test.org.uk
+      - changes the time to live value of the test.org.uk
+      zone to 3 hours
+"""
+
+    parser = OptionParser(usage=usage)
+    parser.add_option("-v", "--verbose", action="store_true", dest="verbose",
+                      default=False, help="Enable verbose mode")
+    parser.add_option("-n", "--no-restart", action="store_false",
+                      dest="restart", default=True,
+                      help="Do not automatically reload nameserver config after changes are completed")
+    parser.add_option("-l", "--local-only", action="store_true",
+                      dest="local_only", default=False,
+                      help="Only modify this nameserver's config and zone files")
+    parser.add_option("-f", "--force", action="store_true", dest="force",
+                      default=False,
+                      help="Force overwrites of zone files without asking")
+    parser.add_option("-t", "--ttl", dest="ttl", default=None,
+                      help="Specify a time to live for a specific resource record")
+    parser.add_option("-x", "--exclude", dest="exclude", default=None,
+                      help="Specify a comma-separated list of domains to exclude from an ip-change  or ip-ttl command")
+    
+    # Parse the options and arguments
+    (options, args) = parser.parse_args()
+    
+    # Check that they have provided args
+    if len(args) == 0:
+        parser.print_usage()
+        sys.exit(2)
+    
+    # Read in our config
+    conf = ConfigParser()
+    conf.read('/etc/dnsadmin/dnsadmin.conf')
+    
+    # Set up our nameserver list
+    if conf.get('nameservers', 'ns') == '':
+        nameservers = []
+    else:
+        nameservers = conf.get('nameservers', 'ns').split(',')
+    
+    # We need the bind uid & gid for most commands
+    uid = int(pwd.getpwnam(conf.get("bind", "uid"))[2])
+    gid = int(grp.getgrnam(conf.get("bind", "gid"))[2])
+    
+    # We should have our 'command' arg - 'add', 'edit', 'del[ete]', etc
+    ## ZONE ADDING ##
+    if args[0] == 'add' or args[0] == 'zone':
+        # Deal with adding a zone - we need a zone name and an ip
+        if len(args) < 3:
+            arg_number_error(args[0]) # quit
+            
+        # args[1] must be the ZONE - validate it
+        zone_name = args[1].lower()
+        if zone_name[-1] != '.':
+            zone_name = zone_name+'.'
+        valid_zone = validate_zone(zone_name)
+        # args[2] must be the IP - validate it
+        ip = args[2]
+        valid_ip = validate_ip(ip)
+
+        if valid_zone and valid_ip:
+            # Try and generate the zone
+            if options.verbose:
+                print "Attempting to add %s zone, using IP address %s" \
+                % (args[1], args[2])
+            # Instantiate our zone object
+            z = Zone(zone_name)
+            z.zone_file = os.path.join(conf.get("bind", "zonefile_path"), conf.get("bind", "zonefile_format").replace('%', z.name[0:-1]))
+            # Check zone does not already exist
+            overwrite = False # flag used in user confirmation loop
+            if z.zone_exists():
+                if not options.force:
+                    confirm_msg = "\nThis zone already exists. If you continue, you will overwrite the zone file."
+                    confirm_msg += "\n\nDo you wish to overwrite the zone file? (yes/no): "
+                    confirmed = False
+                    zone_exists = True
+                    try:
+                        confirmation = raw_input(confirm_msg)
+                        while not confirmed:
+                            if confirmation.lower() == 'yes' or confirmation.lower() == 'y':
+                                confirmed = True
+                                overwrite = True
+                            elif confirmation.lower() == 'no' or confirmation.lower() == 'n':
+                                if options.verbose:
+                                    print "Cancelling add request and exiting."
+                                confirmed = True
+                                overwrite = False
+                            else:
+                                print "You must confirm yes or no (y/yes or n/no)"
+                                confirmation = raw_input(confirm_msg)
+                    except UnboundLocalError:
+                        print "Cancelling add request and exiting."
+                        sys.exit(0)
+                else:
+                    overwrite = True
+            
+            if overwrite or not z.zone_exists():
+                # Generate the zone - we only get here if zone doesn't exist, or
+                # they have agreed to overwrite.
+                
+                # Create an SOA, based on the defaults in the config
+                z.setSoa(ttl=conf.get('soa_defaults', 'ttl'),
+                        ns=conf.get('soa_defaults', 'ns1'),
+                        email=conf.get('soa_defaults', 'email'),
+                        serial=int(time.strftime("%Y%m%d01",
+                                                 time.localtime(time.time()))),
+                        refresh=conf.get('soa_defaults', 'refresh'),
+                        retry=conf.get('soa_defaults', 'retry'),
+                        expiry=conf.get('soa_defaults', 'expiry'),
+                        minttl=conf.get('soa_defaults', 'minttl'))
+                
+                # Set up default resource records.
+                z.add_default_records('A', ip)
+                z.add_default_records('CNAME')
+                z.add_default_records('MX')
+                z.add_default_records('NS')
+                z.add_default_records('TXT')
+                
+                # Set up BIND config entry.
+                z.conf_entry = "zone \"%s\" {\n\ttype master;\n\tfile \"%s\";\n};" \
+                                % (z.name[0:-1], conf.get("bind", "zonefile_format").replace('%', z.name[0:-1]))
+                if options.verbose:
+                    print 'Writing zone to BIND config file'
+                # Write to config on this host.
+                try:
+                    conf_written = z.write_to_conf(conf.get("bind", "conf_path"))
+                except IOError:
+                    os.system('''echo -e "\E[1;31mUnable to open BIND config file\033[0m"''')
+                    sys.exit(1)
+                
+                # If conf_written is False, we already had an entry in named.conf
+                if options.verbose and conf_written == False:
+                    print 'Zone was already present in BIND config file'
+                
+                # Write zone file on this host
+                if options.verbose:
+                    print 'Creating zone file'
+                try:
+                    z.write_zone_file(uid, gid)
+                except IOError:
+                    os.system('''echo -e "\E[1;31mUnable to create zone file\033[0m"''')
+                    # Clean up and remove our conf entry if necessary
+                    if conf_written:
+                        remove_from_conf(conf.get('bind', 'conf_path'), zone_name)
+                    sys.exit(1)
+
+                # We need to call dnsadmin over SSH on other nameservers if we
+                # aren't given --local-only
+                if not options.local_only and len(nameservers) > 0:
+                    ssh_command = "dnsadmin --local-only --force add %s %s" % (zone_name, ip)
+                    if not options.restart:
+                        ssh_command = ssh_command + ' --no-restart'
+                    if options.verbose:
+                        ssh_command = ssh_command + ' --verbose'
+                    for ns in nameservers:
+                        if options.verbose:
+                            print "Setting up zone on %s" % ns
+                        os.system('''ssh %s "%s"''' % (ns, ssh_command))
+        else:
+            os.system('''echo -e "\E[1;31mYou must provide a valid domain name for the zone, and a valid IP address\033[0m"''')
+            if valid_zone == False:
+                print "'%s' is not a valid zone/domain name" % zone_name
+            if valid_ip == False:
+                print "'%s' is not a valid IP address" % ip
+            sys.exit(2)
+    
+    ## ZONE EDITING ##
+    elif args[0] == 'edit' or args[0] == 'edit-ptr':
+        if len(args) < 2:
+            arg_number_error(args[0]) # quit
+        
+        if args[0] == 'edit':
+            # args[1] = the zone name
+            if args[1][-1] == '.':
+                zone_name = args[1].lower()
+            else:
+                zone_name = args[1].lower() + '.'
+        else:
+            # args[1] = an IP address
+            zone_name = ip_to_arpa(args[1])
+
+        # Validate the zone
+        valid_zone = validate_zone(zone_name)
+        if valid_zone:
+          z = Zone(zone_name)
+          z.zone_file = os.path.join(conf.get("bind", "zonefile_path"), conf.get("bind", "zonefile_format").replace('%', z.name[0:-1]))
+        else:
+          os.system('''echo -e "\E[1;31mYou must provide a valid domain name for the zone\033[0m"''')
+          print "'%s' is not a valid zone/domain name" % zone_name
+          sys.exit(2)
+        
+        try:
+            # check the modified time of the file
+            pre_mtime = os.stat(z.zone_file)[stat.ST_MTIME]
+            # open it in vim
+            if options.verbose:
+                print "Opening %s zone file in %s..." % (z.name, conf.get("general", "editor"))
+                time.sleep(1)
+            os.system(conf.get("general", "editor") + " %s" % (z.zone_file))
+            
+            # compare new modified time against previous reading
+            post_mtime = os.stat(z.zone_file)[stat.ST_MTIME]
+            if post_mtime > pre_mtime:
+                # The zone file has changed, we need to generate a new serial
+                # and write it to the file. First, create a zone instance
+                if options.verbose:
+                    print "File has been changed. Generating new serial number..."
+                # Parse the zone file to load it into our Zone object
+                z.parse_zone_file()
+                
+                # Update the serial.
+                z.soa['serial'] = update_serial(z.soa['serial'])
+                
+                # Recreate the zone file
+                try:
+                    z.write_zone_file(uid, gid)
+                except IOError:
+                    os.system('''echo -e "\E[1;31mUnable to create zone file\033[0m"''')
+                    sys.exit(1)
+                
+                # Copy this zone file to the other nameservers
+                if len(nameservers) > 0:
+                    for ns in nameservers:
+                        scp_comm = '''scp %s root@%s:%s''' % (z.zone_file, ns, z.zone_file)
+                        if options.verbose:
+                            print "Copying zone to %s" % ns
+                            os.system(scp_comm)
+                        else:
+                            os.system(scp_comm + " >> /dev/null 2<&1")
+                
+                # Reload on other nameservers
+                if not options.local_only and options.restart and len(nameservers) > 0:
+                    for ns in nameservers:
+                        if options.verbose:
+                            print "Reloading BIND on %s" % ns
+                            ssh_command = conf.get("bind", "restart_command")
+                        else:
+                            ssh_command = conf.get("bind", "restart_command") + " >> /dev/null 2>&1"
+                        os.system('''ssh %s "%s"''' % (ns, ssh_command))
+        except OSError:
+            os.system('''echo -e "\E[1;31mCannot find zone file: %s\033[0m"''' % z.zone_file)
+            sys.exit(1)
+
+    
+    ## DELETE COMMAND ##
+    elif args[0] == 'del' or args[0] == 'delete':
+        # delete the zone -  we need a zone name
+        if len(args) < 2:
+            arg_number_error(args[0]) # quit
+
+        # Set up the zone name    
+        if args[1][-1] == '.':
+            zone = args[1].lower()
+        else:
+            zone = args[1].lower() + '.'
+
+        zone_file = zone + 'zone'
+
+        # Ask for confirmation if not give --force option
+        if not options.force:
+            confirmed = False
+        else:
+            confirmed = True
+
+        confirm_msg = "Are you sure you want to delete the %s zone? (Yes/No): "\
+                      % zone
+
+        while not confirmed:
+            confirmation = raw_input(confirm_msg)
+            if confirmation.lower() == 'yes' or confirmation.lower() == 'y':
+                confirmed = True
+            elif confirmation.lower() == 'no' or confirmation.lower() == 'n':
+                if options.verbose:
+                    print "Cancelling delete request and exiting."
+                sys.exit(0)
+            else:
+                print "You must confirm yes or no (y/yes or n/no)"
+
+        if options.verbose:
+            print "Attempting to delete zone %s" % zone
+
+
+        # Remove the entry from BIND config
+        remove_from_conf(conf.get('bind', 'conf_path'), zone)
+        if options.verbose:
+            print "Entry removed from %s" % conf.get('bind', 'conf_path')
+        # Remove the zone file
+        try:
+            os.remove(os.path.join(conf.get("bind", "zonefile_path"),
+                        zone_file))
+            if options.verbose:
+                print "Zonefile removed: %s" % zone_file
+        except OSError:
+            os.system('''echo -e "\E[1;31mCan't find zone file: %s\033[0m"''' \
+                        % zone_file)
+            sys.exit(1)
+        # Repeat on all nameservers if not given --local-only
+        if not options.local_only and len(nameservers) > 0:
+            ssh_command = "dnsadmin --local-only --force del %s " % (zone)
+            if not options.restart:
+                ssh_command = ssh_command + ' --no-restart'
+            if options.verbose:
+                ssh_command = ssh_command + ' --verbose'
+            for ns in nameservers:
+                if options.verbose:
+                    print "Deleting zone on %s" % ns
+                os.system('''ssh %s "%s"''' % (ns, ssh_command))
+    
+    ## PTR ADDING ##
+    elif args[0] == 'ptr':
+        # We need a zone name and an IP for PTRs.
+        if len(args) < 3:
+            arg_number_error(args[0]) # quit
+            
+        # args[1] must be the IP - validate it.
+        ip = args[1]
+        valid_ip = validate_ip(ip)
+        
+        # args[2] must be the ZONE - validate it.
+        zone_name = args[2].lower()
+        if zone_name[-1] != '.':
+            zone_name = zone_name+'.'
+        valid_zone = validate_zone(zone_name)
+        
+        if valid_ip and valid_zone:
+            # Set up our zone & ptr objects
+            z = Zone(ip_to_arpa(ip))
+            # We need our IP address octets
+            octets = ip.split('.')
+            ptr_rec = PTR()
+            ptr_rec.src = octets[3]
+            ptr_rec.tgt = zone_name
+            
+            z.zone_file = os.path.join(conf.get("bind", "zonefile_path"),
+                          conf.get("bind", "zonefile_format").replace("%", z.name[0:-1]))
+            
+            if z.zone_exists():
+                # If this zone file exists, append our record to it
+                if options.verbose:
+                    print "Found '%s' zone file" % z.zone_file
+                z.parse_zone_file()
+                
+                # Update the serial.
+                z.soa['serial'] = update_serial(z.soa['serial'])
+                
+                if options.verbose:
+                    print 'Adding new PTR record to reverse zone file'
+                # Append the PTR to zone object
+                z.ptr.append(ptr_rec.out())
+            else:
+                if options.verbose:
+                    print 'Creating new reverse zone file'
+                # Create an SOA for the zone object
+                z.setSoa(ttl=conf.get('soa_defaults', 'ttl'),
+                        ns=conf.get('soa_defaults', 'ns1'),
+                        email=conf.get('soa_defaults', 'email'),
+                        serial=int(time.strftime("%Y%m%d01",
+                                                 time.localtime(time.time()))),
+                        refresh=conf.get('soa_defaults', 'refresh'),
+                        retry=conf.get('soa_defaults', 'retry'),
+                        expiry=conf.get('soa_defaults', 'expiry'),
+                        minttl=conf.get('soa_defaults', 'minttl'))
+                # Set the default NS records
+                z.add_default_records('NS')
+                # Append the PTR to zone object
+                z.ptr.append(ptr_rec.out())
+            
+            # Write to config on this host.
+            z.conf_entry = "zone \"%s\" {\n\ttype master;\n\tfile \"%s\";\n};" \
+                         % (z.name[0:-1], conf.get("bind", "zonefile_format").replace("%", z.name[0:-1]))
+            try:
+                conf_written = z.write_to_conf(conf.get("bind", "conf_path"))
+            except IOError:
+                os.system('''echo -e "\E[1;31mUnable to open BIND config file\033[0m"''')
+                sys.exit(1)
+            
+            # If conf_written is False, we already had an entry in named.conf
+            if options.verbose and conf_written == False:
+                print 'Zone was already present in BIND config file'
+            
+            # Write zone file on this host
+            if options.verbose:
+                print 'Creating zone file'
+            try:
+                z.write_zone_file(uid, gid)
+            except IOError:
+                os.system('''echo -e "\E[1;31mUnable to create zone file\033[0m"''')
+                # Clean up and remove our conf entry if it was just added
+                if conf_written:
+                    remove_from_conf(conf.get('bind', 'conf_path'), zone_name)
+                sys.exit(1)
+            
+            # Repeat command on all nameservers if not given --local-only
+            if not options.local_only and len(nameservers) > 0:
+                ssh_command = "dnsadmin --local-only ptr %s %s" % (ip, zone_name)
+                if not options.restart:
+                    ssh_command = ssh_command + ' --no-restart'
+                for ns in nameservers:
+                    if options.verbose:
+                        print "Adding PTR record on %s" % ns
+                    os.system('''ssh %s "%s"''' % (ns, ssh_command))
+        else:
+            os.system('''echo -e "\E[1;31mYou must provide a valid domain name for the zone, and a valid IP address\033[0m"''')
+            if valid_zone == False:
+                print "'%s' is not a valid zone/domain name" % zone_name
+            if valid_ip == False:
+                print "'%s' is not a valid IP address" % ip
+            sys.exit(2)
+    
+    ## IMPORTING ##
+    elif args[0] == 'import':
+        # Ask for a path to the zone files
+        try:
+            import_dir = raw_input("Enter directory where zone files are located [/var/lib/dnsadmin/import/]: ")
+        except KeyboardInterrupt:
+            print ''
+            sys.exit(1)
+        if import_dir == '':
+            import_dir = '/var/lib/dnsadmin/import/'
+        if not os.path.isdir(import_dir):
+            # The directory does not exist
+            os.system('''echo -e "\E[1;31m%s is not a directory.\033[0m"''' % import_dir)
+            sys.exit(1)
+        else:
+            yes_to_all = False
+            # Work through each file and import it
+            ls_output = os.listdir(import_dir)
+            for imp_zone in ls_output:
+                if yes_to_all:
+                    # Just import without prompting
+                    zone_import(os.path.join(import_dir, imp_zone), options, conf)
+                else:
+                    # Ask for confirmation
+                    answered = False
+                    while not answered:
+                        do_import = raw_input("Import %s? ([Y]es/[N]o/Yes to [A]ll/[C]ancel): " % imp_zone)
+                        if do_import.lower() == 'y':
+                            answered = True
+                            zone_import(os.path.join(import_dir, imp_zone), options, conf)
+                        elif do_import.lower() == 'a':
+                            # Set yes_to_all to True, so we don't ask again
+                            answered = True
+                            yes_to_all = True
+                            zone_import(os.path.join(import_dir, imp_zone), options, conf)
+                        elif do_import.lower() == 'n':
+                            # Skip this zone file
+                            answered = True
+                        elif do_import.lower() == 'c':
+                            sys.exit(0)
+                        else:
+                            print "You must type 'y', 'n', 'a' or 'c' to continue."
+        
+    ## ADD TO CONF ONLY (non-documented function) ##                    
+    elif args[0] == 'conf':
+        zone_name = args[1].lower()
+        if zone_name[-1] != '.':
+            zone_name = zone_name+'.'
+        if validate_zone(zone_name):
+            z = Zone(zone_name)
+            z.zone_file = os.path.join(conf.get("bind", "zonefile_path"), conf.get("bind", "zonefile_format").replace('%', z.name[0:-1]))
+            z.conf_entry = "zone \"%s\" {\n\ttype master;\n\tfile \"%s\";\n};" \
+                                % (z.name[0:-1], conf.get("bind", "zonefile_format").replace('%', z.name[0:-1]))
+            written = z.write_to_conf(conf.get("bind", "conf_path"))
+            if options.verbose:
+                if written:
+                    print "Written %s to conf file." % z.name[0:-1]
+                else:
+                    print "Already found %s in conf file." % z.name[0:-1]
+                
+        else:
+            print "Invalid zone name"
+            sys.exit(1)
+    
+    ## SUBDOMAIN COMMAND ##
+    elif args[0] == 'sub':
+        if len(args) < 4:
+            arg_number_error(args[0]) # quit
+        
+        # Command should be "sub subdomain zone_name ip_addr"
+        subdomain = args[1].lower()
+        valid_sub = validate_hostname(subdomain, is_subdomain=True)
+        zone_name = args[2].lower()
+        if zone_name[-1] != '.':
+            zone_name = zone_name+'.'
+        valid_zone = validate_zone(zone_name)
+        ip_addr = args[3]
+        valid_ip = validate_ip(ip_addr)
+        
+        if valid_sub and valid_zone and valid_ip:
+            z = Zone(zone_name)
+            z.zone_file = os.path.join(conf.get("bind", "zonefile_path"), conf.get("bind", "zonefile_format").replace('%', z.name[0:-1]))
+            ns_objects = []
+            # Create NS object for this host
+            ns_rec = NS()
+            ns_rec.src = subdomain
+            ns_rec.setTgt(socket.getfqdn(), fqdn=1)
+            # Add this NS object to our ns_entries list
+            ns_objects.append(ns_rec)
+            
+            # Create NS records for our other DNS servers
+            for ns in nameservers:
+                ns_rec = NS()
+                ns_rec.src = subdomain
+                ns_rec.setTgt(ns, fqdn=1)
+                ns_objects.append(ns_rec)
+            
+            # Look for the zone file, if it exists, add NS records.
+            if z.zone_exists():
+                if options.verbose:
+                    print "Zone file for parent zone, %s exists on this server. Adding NS records to parent zone..." \
+                          % z.name[0:-1]
+                z.parse_zone_file()
+                # Add our NS records to this zone
+                for ns_rec in ns_objects:
+                    z.ns.append(ns_rec.out())
+                # Update the serial.
+                z.soa['serial'] = update_serial(z.soa['serial'])
+                # Write out the new zone
+                z.write_zone_file(uid, gid)
+            else:
+                # If zone file does not exist, create minimal zone file
+                if options.verbose:
+                    print "Zone file for parent zone, %s not found on this server." % z.name[0:-1]
+                
+                # Set the SOA of the parent zone
+                z.setSoa(ttl=conf.get('soa_defaults', 'ttl'),
+                        ns=conf.get('soa_defaults', 'ns1'),
+                        email=conf.get('soa_defaults', 'email'),
+                        serial=int(time.strftime("%Y%m%d01",
+                                                time.localtime(time.time()))),
+                        refresh=conf.get('soa_defaults', 'refresh'),
+                        retry=conf.get('soa_defaults', 'retry'),
+                        expiry=conf.get('soa_defaults', 'expiry'),
+                        minttl=conf.get('soa_defaults', 'minttl'))
+                
+                # Add zone NS records from template
+                z.add_default_records('NS')
+                # Add the subdomain's NS records
+                for ns_rec in ns_objects:
+                    z.ns.append(ns_rec.out())
+                
+                # Set up BIND config entry for new parent zone.
+                z.conf_entry = "zone \"%s\" {\n\ttype master;\n\tfile \"%s\";\n};" \
+                    % (z.name[0:-1], conf.get("bind", "zonefile_format").replace('%', z.name[0:-1]))
+                if options.verbose:
+                    print 'Writing parent zone to BIND config file'
+                # Write to config on this host.
+                try:
+                    conf_written = z.write_to_conf(conf.get("bind", "conf_path"))
+                except IOError:
+                    os.system('''echo -e "\E[1;31mUnable to open BIND config file\033[0m"''')
+                    sys.exit(1)
+                
+                # If conf_written is False, we already had an entry in named.conf
+                if options.verbose and conf_written == False:
+                    print 'Zone was already present in BIND config file'
+                
+                # Write zone file on this host
+                if options.verbose:
+                    print 'Creating parent zone file'
+                try:
+                    z.write_zone_file(uid, gid)
+                except IOError:
+                    os.system('''echo -e "\E[1;31mUnable to create zone file\033[0m"''')
+                    # Clean up and remove our conf entry if necessary
+                    if conf_written:
+                        remove_from_conf(conf.get('bind', 'conf_path'), zone_name)
+                    sys.exit(1)
+
+            # Create a new zone file for the subdomain, creating records from
+            # the template, pointing to the provided IP
+            sub_z = Zone(subdomain + '.' + z.name)
+            sub_z.zone_file = os.path.join(conf.get("bind", "zonefile_path"), conf.get("bind", "zonefile_format").replace('%', sub_z.name[0:-1]))
+            overwrite = False
+            if sub_z.zone_exists() and not options.force:
+                confirm_msg = "\nThis zone already exists. If you continue, you will overwrite the zone file."
+                confirm_msg += "\n\nDo you wish to overwrite the zone file? (yes/no): "
+                confirmed = False
+                zone_exists = True
+                try:
+                    confirmation = raw_input(confirm_msg)
+                    while not confirmed:
+                        if confirmation.lower() == 'yes' or confirmation.lower() == 'y':
+                            confirmed = True
+                            overwrite = True
+                        elif confirmation.lower() == 'no' or confirmation.lower() == 'n':
+                            if options.verbose:
+                                print "Cancelling add request and exiting."
+                            confirmed = True
+                            overwrite = False
+                        else:
+                            print "You must confirm yes or no (y/yes or n/no)"
+                            confirmation = raw_input(confirm_msg)
+                except UnboundLocalError:
+                    print "Cancelling add request and exiting."
+                    sys.exit(0)
+            
+            if overwrite or not sub_z.zone_exists():
+                # Generate the zone - we only get here if zone doesn't exist, or
+                # they have agreed to overwrite.
+                
+                # Create an SOA, based on the defaults in the config
+                sub_z.setSoa(ttl=conf.get('soa_defaults', 'ttl'),
+                        ns=conf.get('soa_defaults', 'ns1'),
+                        email=conf.get('soa_defaults', 'email'),
+                        serial=int(time.strftime("%Y%m%d01",
+                                                  time.localtime(time.time()))),
+                        refresh=conf.get('soa_defaults', 'refresh'),
+                        retry=conf.get('soa_defaults', 'retry'),
+                        expiry=conf.get('soa_defaults', 'expiry'),
+                        minttl=conf.get('soa_defaults', 'minttl'))
+                
+                # Set up default resource records
+                sub_z.add_default_records('A', ip_addr)
+                sub_z.add_default_records('CNAME')
+                sub_z.add_default_records('MX')
+                sub_z.add_default_records('NS')
+                sub_z.add_default_records('TXT')
+                
+                # Set up BIND config entry.
+                sub_z.conf_entry = "zone \"%s\" {\n\ttype master;\n\tfile \"%s\";\n};" \
+                                % (sub_z.name[0:-1], conf.get("bind", "zonefile_format").replace('%', sub_z.name[0:-1]))
+                if options.verbose:
+                    print 'Writing zone to BIND config file'
+                # Write to config on this host.
+                try:
+                    conf_written = sub_z.write_to_conf(conf.get("bind", "conf_path"))
+                except IOError:
+                    os.system('''echo -e "\E[1;31mUnable to open BIND config file\033[0m"''')
+                    sys.exit(1)
+                
+                # If conf_written is False, we already had an entry in named.conf
+                if options.verbose and conf_written == False:
+                    print 'Zone was already present in BIND config file'
+                
+                # Write zone file on this host
+                if options.verbose:
+                    print 'Creating zone file'
+                try:
+                    sub_z.write_zone_file(uid, gid)
+                except IOError:
+                    os.system('''echo -e "\E[1;31mUnable to create zone file\033[0m"''')
+                    # Clean up and remove our conf entry if necessary
+                    if conf_written:
+                        remove_from_conf(conf.get('bind', 'conf_path'), sub_z.name[0:-1])
+                    sys.exit(1)
+                
+            # Run command on all other nameservers
+            if not options.local_only and len(nameservers) > 0:
+                ssh_command = "dnsadmin --local-only --force sub %s %s %s" % (subdomain, zone_name, ip_addr)
+                if not options.restart:
+                    ssh_command = ssh_command + ' --no-restart'
+                if options.verbose:
+                    ssh_command = ssh_command + ' --verbose'
+                for ns in nameservers:
+                    if options.verbose:
+                        print "Setting up zone on %s" % ns
+                    os.system('''ssh %s "%s"''' % (ns, ssh_command))
+
+        else:
+            if not valid_sub:
+                print "You provided an invalid subdomain name: %s (must be a valid DNS host name)." % subdomain
+            if not valid_zone:
+                print "You provided an invalid zone name: %s" % zone_name
+            if not valid_ip:
+                print "You provided an invalid IP address: %s" % ip_addr
+            
+        
+    ## A RECORD COMMAND ##
+    elif args[0] == 'a':
+        if len(args) < 4:
+            # Error - need 4 args
+            arg_number_error(args[0]) # quit
+
+        # Command received: "a host zone ip"
+        host = args[1].lower()
+        # We don't want the hostname to end with '.' - this will break things
+        if host[-1] == '.':
+            host = host[0:-1]
+        valid_host = validate_hostname(host)
+        zone_name = args[2].lower()
+        if zone_name[-1] != '.':
+            zone_name = zone_name+'.'
+        valid_zone = validate_zone(zone_name)
+        ip_addr = args[3]
+        valid_ip = validate_ip(ip_addr)
+        
+        if valid_host and valid_zone and valid_ip:
+            # All data was OK, add an A record for this zone
+            z = Zone(zone_name)
+            z.zone_file = os.path.join(conf.get("bind", "zonefile_path"), conf.get("bind", "zonefile_format").replace('%', z.name[0:-1]))
+            a = A()
+            a.src = host
+            a.tgt = ip_addr
+            if options.ttl != None:
+                if options.verbose:
+                    print "Adding TTL of %s to this A record." % options.ttl
+                # Set a TTL for this record.
+                a.ttl = options.ttl
+            
+            # If this zone exists, just add the A record and update serial.
+            if z.zone_exists():
+                if options.verbose:
+                    print "Zone file for %s exists on this server. Adding A records to zone..." \
+                          % z.name[0:-1]
+                z.parse_zone_file()
+                # Add the A record to the zones list of A records
+                z.a.append(a.out())
+
+                # Update the serial.
+                z.soa['serial'] = update_serial(z.soa['serial'])
+                
+            # If the zone doesn't exist, create it.
+            else:
+                if options.verbose:
+                    print 'Creating new zone file for %s...' % z.name[0:-1]
+                # Create an SOA for the zone object
+                z.setSoa(ttl=conf.get('soa_defaults', 'ttl'),
+                        ns=conf.get('soa_defaults', 'ns1'),
+                        email=conf.get('soa_defaults', 'email'),
+                        serial=int(time.strftime("%Y%m%d01",
+                                                  time.localtime(time.time()))),
+                        refresh=conf.get('soa_defaults', 'refresh'),
+                        retry=conf.get('soa_defaults', 'retry'),
+                        expiry=conf.get('soa_defaults', 'expiry'),
+                        minttl=conf.get('soa_defaults', 'minttl'))
+                # Set the default NS records
+                z.add_default_records('NS')
+                # Add the A record
+                z.a.append(a.out())
+            
+            # Set up BIND config entry.
+            z.conf_entry = "zone \"%s\" {\n\ttype master;\n\tfile \"%s\";\n};" \
+                % (z.name[0:-1], conf.get("bind", "zonefile_format").replace('%', z.name[0:-1]))
+            # Now write to config
+            if options.verbose:
+                print "Writing zone to BIND config file..."
+            try:
+                conf_written = z.write_to_conf(conf.get("bind", "conf_path"))
+            except IOError:
+                os.system('''echo -e "\E[1;31mUnable to open BIND config file\033[0m"''')
+                sys.exit(1)
+            
+            # If conf_written is False, we already had an entry in named.conf
+            if options.verbose and conf_written == False:
+                print 'Zone was already present in BIND config file'
+            
+            # Write zone file on this host
+            if options.verbose:
+                print 'Building zone file...'
+            try:
+                z.write_zone_file(uid, gid)
+            except IOError:
+                os.system('''echo -e "\E[1;31mUnable to create zone file\033[0m"''')
+                sys.exit(1)
+            
+            # Repeat command on all nameservers if not given --local-only
+            if not options.local_only and len(nameservers) > 0:
+                ssh_command = r'dnsadmin --local-only a %s %s %s' % (host, zone_name, ip_addr)
+                if not options.restart:
+                    ssh_command = ssh_command + ' --no-restart'
+                if options.ttl != None:
+                    ssh_command = ssh_command + ' --ttl=%s' % options.ttl
+                for ns in nameservers:
+                    if options.verbose:
+                        print "Adding A record on %s" % ns
+                    os.system('''ssh %s "%s"''' % (ns, ssh_command))
+            
+        else:
+            if not valid_host:
+                print "You provided an invalid host name: %s" % host
+            if not valid_zone:
+                print "You provided an invalid zone name: %s" % zone_name
+            if not valid_ip:
+                print "You provided an invalid IP address: %s" % ip_addr
+        
+
+    ## CNAME RECORD COMMAND ##
+    elif args[0] == 'cname':
+        if len(args) < 4:
+            # Error - need 4 args
+            arg_number_error(args[0])
+        
+        # Command will be 'cname host zone alias'
+        host = args[1].lower()
+        # We don't want the hostname to end with '.' - this will break things
+        if host[-1] == '.':
+            host = host[0:-1]
+        valid_host = validate_hostname(host)
+        zone_name = args[2].lower()
+        if zone_name[-1] != '.':
+            zone_name += '.'
+        valid_zone = validate_zone(zone_name)
+        alias = args[3].lower()
+        if alias[-1] != '.':
+            alias += '.'
+        
+        valid_alias = validate_zone(alias)
+        
+        if valid_host and valid_zone and valid_alias:
+            z = Zone(zone_name)
+            z.zone_file = os.path.join(conf.get("bind", "zonefile_path"), conf.get("bind", "zonefile_format").replace('%', z.name[0:-1]))
+            cname = CNAME()
+            cname.src = host
+            cname.tgt = alias
+            
+            if options.ttl != None:
+                if options.verbose:
+                    print "Adding TTL of %s to this CNAME record." % options.ttl
+                # Set a TTL for this record.
+                cname.ttl = options.ttl
+            
+            # If this zone exists, just add the MX record and update serial.
+            if z.zone_exists():
+                if options.verbose:
+                    print "Zone file for %s exists on this server. Adding CNAME record to zone..." \
+                          % z.name[0:-1]
+                z.parse_zone_file()
+                # Add the MX record to the zone's list of MX records
+                z.cname.append(cname.out())
+
+                # Update the serial.
+                z.soa['serial'] = update_serial(z.soa['serial'])
+            
+            # If the zone doesn't exist, create it.
+            else:
+                if options.verbose:
+                    print 'Creating new zone file for %s...' % z.name[0:-1]
+                # Create an SOA for the zone object
+                z.setSoa(ttl=conf.get('soa_defaults', 'ttl'),
+                        ns=conf.get('soa_defaults', 'ns1'),
+                        email=conf.get('soa_defaults', 'email'),
+                        serial=int(time.strftime("%Y%m%d01",
+                                                  time.localtime(time.time()))),
+                        refresh=conf.get('soa_defaults', 'refresh'),
+                        retry=conf.get('soa_defaults', 'retry'),
+                        expiry=conf.get('soa_defaults', 'expiry'),
+                        minttl=conf.get('soa_defaults', 'minttl'))
+                # Set the default NS records
+                z.add_default_records('NS')
+                # Add the MX record to the zone's list of MX records
+                z.cname.append(cname.out())
+            
+            # Set up BIND config entry.
+            z.conf_entry = "zone \"%s\" {\n\ttype master;\n\tfile \"%s\";\n};" \
+                % (z.name[0:-1], conf.get("bind", "zonefile_format").replace('%', z.name[0:-1]))    
+            # Now write to config
+            try:
+                conf_written = z.write_to_conf(conf.get("bind", "conf_path"))
+            except IOError:
+                os.system('''echo -e "\E[1;31mUnable to open BIND config file\033[0m"''')
+                sys.exit(1)
+            
+            # If conf_written is False, we already had an entry in named.conf
+            if options.verbose and conf_written == False:
+                print 'Zone was already present in BIND config file'
+            
+            # Write zone file on this host
+            if options.verbose:
+                print 'Building zone file...'
+            try:
+                z.write_zone_file(uid, gid)
+            except IOError:
+                os.system('''echo -e "\E[1;31mUnable to create zone file\033[0m"''')
+                sys.exit(1)
+            
+            # Repeat command on all nameservers if not given --local-only
+            if not options.local_only and len(nameservers) > 0:
+                ssh_command = r'dnsadmin --local-only cname %s %s %s' % (args[1], args[2], args[3])
+                if not options.restart:
+                    ssh_command = ssh_command + ' --no-restart'
+                if options.ttl != None:
+                    ssh_command = ssh_command + ' --ttl=%s' % options.ttl
+                for ns in nameservers:
+                    if options.verbose:
+                        print "Adding CNAME record on %s" % ns
+                    os.system('''ssh %s "%s"''' % (ns, ssh_command))
+        
+        else:
+            if not valid_host:
+                print "You provided an invalid host name: %s" % host
+            if not valid_zone:
+                print "You provided an invalid zone name: %s" % zone_name
+            if not valid_alias:
+                print "You provided an invalid alias: %s (it must be a fully qualified domain name." % alias
+            sys.exit(1)
+    
+    
+    ## MX RECORD COMMAND ##
+    elif args[0] == 'mx':
+        if len(args) < 4:
+            # Error - need 4 args
+            arg_number_error(args[0]) # quit
+        
+        # Command received will be 'mx host:preference zone mailserver'
+        host_pref = args[1].split(':')
+        host = host_pref[0].lower()
+        # We don't want the hostname to end with '.' - this will break things
+        if host[-1] == '.':
+            host = host[0:-1]
+        valid_host = validate_hostname(host)
+        preference = host_pref[1]
+        valid_preference = validate_preference(preference)
+        zone_name = args[2].lower()
+        if zone_name[-1] != '.':
+            zone_name += '.'
+        valid_zone = validate_zone(zone_name)
+        mailserver = args[3].lower()
+        if mailserver[-1] == '.':
+            valid_mailserver = validate_zone(mailserver)
+        else:
+            valid_mailserver = validate_hostname(mailserver)
+        
+        if valid_host and valid_preference and valid_zone and valid_mailserver:
+            # All data was OK, add this MX record.
+            z = Zone(zone_name)
+            z.zone_file = os.path.join(conf.get("bind", "zonefile_path"), conf.get("bind", "zonefile_format").replace('%', z.name[0:-1]))
+            mx = MX()
+            mx.src = host
+            mx.pref = preference
+            mx.tgt = mailserver
+            
+            if options.ttl != None:
+                if options.verbose:
+                    print "Adding TTL of %s to this MX record." % options.ttl
+                # Set a TTL for this record.
+                mx.ttl = options.ttl
+            
+            # If this zone exists, just add the MX record and update serial.
+            if z.zone_exists():
+                if options.verbose:
+                    print "Zone file for %s exists on this server. Adding MX record to zone..." \
+                          % z.name[0:-1]
+                z.parse_zone_file()
+                # Add the MX record to the zone's list of MX records
+                z.mx.append(mx.out())
+
+                # Update the serial.
+                z.soa['serial'] = update_serial(z.soa['serial'])
+                
+            # If the zone doesn't exist, create it.
+            else:
+                if options.verbose:
+                    print 'Creating new zone file for %s...' % z.name[0:-1]
+                # Create an SOA for the zone object
+                z.setSoa(ttl=conf.get('soa_defaults', 'ttl'),
+                        ns=conf.get('soa_defaults', 'ns1'),
+                        email=conf.get('soa_defaults', 'email'),
+                        serial=int(time.strftime("%Y%m%d01",
+                                                  time.localtime(time.time()))),
+                        refresh=conf.get('soa_defaults', 'refresh'),
+                        retry=conf.get('soa_defaults', 'retry'),
+                        expiry=conf.get('soa_defaults', 'expiry'),
+                        minttl=conf.get('soa_defaults', 'minttl'))
+                # Set the default NS records
+                z.add_default_records('NS')
+                # Add the MX record to the zone's list of MX records
+                z.mx.append(mx.out())
+            
+            # Set up BIND config entry.
+            z.conf_entry = "zone \"%s\" {\n\ttype master;\n\tfile \"%s\";\n};" \
+                % (z.name[0:-1], conf.get("bind", "zonefile_format").replace('%', z.name[0:-1]))    
+            # Now write to config
+            try:
+                conf_written = z.write_to_conf(conf.get("bind", "conf_path"))
+            except IOError:
+                os.system('''echo -e "\E[1;31mUnable to open BIND config file\033[0m"''')
+                sys.exit(1)
+            
+            # If conf_written is False, we already had an entry in named.conf
+            if options.verbose and conf_written == False:
+                print 'Zone was already present in BIND config file'
+            
+            # Write zone file on this host
+            if options.verbose:
+                print 'Building zone file...'
+            try:
+                z.write_zone_file(uid, gid)
+            except IOError:
+                os.system('''echo -e "\E[1;31mUnable to create zone file\033[0m"''')
+                sys.exit(1)
+        
+            # Repeat command on all nameservers if not given --local-only
+            if not options.local_only and len(nameservers) > 0:
+                ssh_command = r'dnsadmin --local-only mx %s %s %s' % (args[1], zone_name, mailserver)
+                if not options.restart:
+                    ssh_command = ssh_command + ' --no-restart'
+                if options.ttl != None:
+                    ssh_command = ssh_command + ' --ttl=%s' % options.ttl
+                for ns in nameservers:
+                    if options.verbose:
+                        print "Adding MX record on %s" % ns
+                    os.system('''ssh %s "%s"''' % (ns, ssh_command))
+                    
+        else:
+            if not valid_host:
+                print "You provided an invalid host name: %s" % host
+            if not valid_preference:
+                print "You provided an invalid MX preference: %s" % preference
+            if not valid_zone:
+                print "You provided an invalid zone name: %s" % zone_name
+            if not valid_mailserver:
+                print "You provided an invalid mailserver: %s" % mailserver
+
+
+    ## NS RECORD COMMAND ##
+    elif args[0] == 'ns':
+        print "NS record functionality not implemented yet"
+    
+    
+    ## TTL-ZONE COMMAND ##
+    elif args[0] == 'ttl' or args[0] == 'ttl-zone':
+        # We need a ttl time and a zone for this command
+        if len(args) < 3:
+            # Error - need 3 args
+            arg_number_error(args[0]) # quit
+        
+        ttl = args[1].lower()
+        valid_ttl = validate_ttl(ttl)
+        
+        zone_name = args[2].lower()
+        if zone_name[-1] != '.':
+            zone_name = zone_name+'.'
+        valid_zone = validate_zone(zone_name)
+        
+        if valid_ttl and valid_zone:
+            z = Zone(zone_name)
+            z.zone_file = os.path.join(conf.get("bind", "zonefile_path"), conf.get("bind", "zonefile_format").replace('%', z.name[0:-1]))
+            if z.zone_exists():
+                if options.verbose:
+                    print "Changing TTL to %s for %s" % (ttl, zone_name)
+                # Load the zone file into the zone object.
+                z.parse_zone_file()
+                # Modify the TTL sections of the SOA.
+                z.soa['ttl'] = ttl
+                z.soa['minttl'] = ttl
+                # Update the serial.
+                z.soa['serial'] = update_serial(z.soa['serial'])
+                # Rewrite the zone file.
+                z.write_zone_file(uid, gid)
+                
+                if not options.local_only and len(nameservers) > 0:
+                    ssh_command = r'dnsadmin --local-only ttl %s %s' % (ttl, zone_name)
+                    if not options.restart:
+                        ssh_command = ssh_command + ' --no-restart'
+                    if options.verbose:
+                        ssh_command = ssh_command + ' --verbose'
+                    for ns in nameservers:
+                        if options.verbose:
+                            print "Running command on %s" % ns
+                        os.system('''ssh %s "%s"''' % (ns, ssh_command))
+
+            else:
+                print "%s zone not found. Cannot update the TTL on a non-existant zone." % z.name
+                sys.exit(2)
+        else:
+            if not valid_ttl:
+                print "You provided an invalid TTL."
+            if not valid_zone:
+                print "%s is not a valid zone name." % zone_name
+            sys.exit(2)
+    
+    
+    ## SERIAL UPDATE COMMAND ###
+    elif args[0] == 'serial':
+        # We only need a zone name for this command
+        if len(args) < 2:
+            # Error - need 2 args
+            arg_number_error(args[0]) # quit
+        
+        zone_name = args[1].lower()
+        if zone_name[-1] != '.':
+            zone_name = zone_name+'.'
+        valid_zone = validate_zone(zone_name)
+        
+        if valid_zone:
+            z = Zone(zone_name)
+            z.zone_file = os.path.join(conf.get("bind", "zonefile_path"), conf.get("bind", "zonefile_format").replace('%', z.name[0:-1]))
+            if z.zone_exists():
+                # Read in the zone_file
+                z.parse_zone_file()
+                # Update the serial.
+                z.soa['serial'] = update_serial(z.soa['serial'])
+                # Rewrite the zone file.
+                z.write_zone_file(uid, gid)
+                if options.verbose:
+                    print "Updated serial to %s" % z.soa['serial']
+
+                if not options.local_only and len(nameservers) > 0:
+                    ssh_command = r'dnsadmin --local-only serial %s' % zone_name
+                    if not options.restart:
+                        ssh_command = ssh_command + ' --no-restart'
+                    if options.verbose:
+                        ssh_command = ssh_command + ' --verbose'
+                    for ns in nameservers:
+                        if options.verbose:
+                            print "Updating serial for %s record on %s" % (z.name, ns)
+                        os.system('''ssh %s "%s"''' % (ns, ssh_command))
+            else:
+                print "%s zone not found. Cannot update the serial on a non-existant zone." % z.name
+                sys.exit(2)
+
+
+    ## IP-CHANGE COMMAND ##
+    elif args[0] == 'ip-change':
+        if len(args) < 3:
+            arg_number_error(args[0]) # quit
+
+        # Validate the IP addresses
+        old_ip = args[1] # the old IP we are searching for
+        new_ip = args[2] # the new IP we are changing to
+        valid_old_ip = validate_ip(old_ip)
+        valid_new_ip = validate_ip(new_ip)
+        if valid_old_ip and valid_new_ip:
+            # Create a list of files to exclude
+            if options.exclude != None:
+                exclusions = options.exclude.split(',')
+                ctr = 0
+                while ctr < len(exclusions):
+                    exclusions[ctr] = conf.get("bind", "zonefile_format").replace('%', exclusions[ctr])
+                    ctr += 1
+            else:
+                # No exclusions
+                exclusions = []
+            if options.verbose:
+                print "Searching zones for %s and change it to %s" % (old_ip, new_ip)
+                if options.exclude != None:
+                    print "Excluding %s from the change" % options.exclude.replace(',', ', ')
+            
+            # Now create a list of hits for the search
+            zone_path = os.path.join(conf.get("bind", "zonefile_path"))
+            files = os.walk(zone_path).next()[2]
+            #print "Searching through %d zones..." % len(files)
+            zone_hits = []
+            for file in files:
+                if re.search(r'\.zone$', file) and (not file in exclusions):
+                    # This is a zone file, which isn't set to be excluded - parse it
+                    z = Zone(file.replace('.zone', '.'))
+                    z.zone_file = os.path.join(zone_path, file)
+                    try:
+                        z.parse_zone_file()
+                    except IndexError:
+                        print "Problem parsing zone file: %s" % z.zone_file
+                        sys.exit(1)
+                    # Search through the zone's A records for old_ip
+                    for a in z.a:
+                        if re.search(old_ip + '(\s|$)', a):
+                            zone_hits.append(z)
+                            break
+            # Quit if there are no zones available
+            if len(zone_hits) == 0:
+                print "No zones found with A records resolving to %s." % old_ip
+                sys.exit(0)
+
+            # Sort our zone_hits list into alphabetical order
+            zone_hits.sort()
+            
+            # We now have a list of zones, display them and ask for confirmation (if not --force)
+            msg = "\nFound %d zones with A records pointing to %s:\n" % (len(zone_hits), old_ip)
+            msg += (len(msg) - 2) * '=' + "\n"
+            for zone in zone_hits:
+                msg += "  %s (TTL: %s)\n" % (zone.name, zone.soa['ttl'])
+            print msg
+
+            if not options.force:
+                confirmed = False
+            else:
+                confirmed = True
+            confirm_msg = "Change %s to %s in these zones? (Yes/No): " % (old_ip, new_ip)
+            while not confirmed:
+                confirmation = raw_input(confirm_msg)
+                if confirmation.lower() == 'yes' or confirmation.lower() == 'y':
+                    confirmed = True
+                elif confirmation.lower() == 'no' or confirmation.lower() == 'n':
+                    if options.verbose:
+                        print "Cancelling IP change request and exiting."
+                    sys.exit(0)
+                else:
+                    print "You must confirm yes or no (y/yes or n/no)"
+
+            # Update A record IP addresses for each zone
+            for z in zone_hits:
+                new_a = []
+                for a_rec in z.a:
+                    new_a.append(a_rec.replace(old_ip, new_ip))
+                # Assign the new A record list
+                z.a = new_a
+                # Update the serial
+                z.soa['serial'] = update_serial(z.soa['serial'])
+                # Rebuild the zone file
+                try:
+                    z.write_zone_file(uid, gid)
+                except IOError:
+                    os.system('''echo -e "\E[1;31mUnable to create zone file\033[0m"''')
+                    sys.exit(1)
+             
+            # Copy the zone files to the other nameservers
+            scp_src = ''
+            for z in zone_hits:
+                scp_src += z.zone_file + ' '
+            if len(nameservers) > 0:
+                for ns in nameservers:
+                    scp_comm = '''scp %s root@%s:%s''' % (scp_src, ns, conf.get("bind", "zonefile_path"))
+                    if options.verbose:
+                        print "Copying %d updated zones to %s" % (len(zone_hits), ns)
+                        os.system(scp_comm)
+                    else:
+                        os.system(scp_comm + " >> /dev/null 2<&1")
+
+            # Reload on all nameservers
+            if not options.local_only and options.restart and len(nameservers) > 0:
+                for ns in nameservers:
+                    if options.verbose:
+                        print "Reloading BIND on %s" % ns
+                        ssh_command = conf.get("bind", "restart_command")
+                    else:
+                        ssh_command = conf.get("bind", "restart_command") + " >> /dev/null 2>&1"
+                    os.system('''ssh %s "%s"''' % (ns, ssh_command))
+            
+        else:
+            os.system('''echo -e "\E[1;31mYou must provide two valid IP addresses\033[0m"''')
+            if valid_old_ip == False:
+                print "'%s' is not a valid IP address" % old_ip
+            if valid_new_ip == False:
+                print "'%s' is not a valid IP address" % new_ip
+            sys.exit(2)
+    
+    
+    ## TTL-IP COMMAND ##
+    elif args[0] == 'ttl-ip':
+        if len(args) < 3:
+            arg_number_error(args[0]) # quit with an error
+
+        ttl = args[1] # the ttl we are changing to
+        ip = args[2] # the IP we are searching for
+        # validate the IP address
+        valid_ip = validate_ip(ip)
+        # validate the ttl string
+        valid_ttl = validate_ttl(ttl)
+        if valid_ttl and valid_ip:
+            # Create a list of files to exclude
+            if options.exclude != None:
+                exclusions = options.exclude.split(',')
+                ctr = 0
+                while ctr < len(exclusions):
+                    exclusions[ctr] = conf.get("bind", "zonefile_format").replace('%', exclusions[ctr])
+                    ctr += 1
+            else:
+                # No exclusions
+                exclusions = []
+            if options.verbose:
+                print "Searching zones for %s" % ip
+                if options.exclude != None:
+                    print "Excluding %s from the change" % options.exclude.replace(',', ', ')
+            
+            # Now create a list of hits for the search
+            zone_path = os.path.join(conf.get("bind", "zonefile_path"))
+            files = os.walk(zone_path).next()[2]
+            #print "Searching through %d zones..." % len(files)
+            zone_hits = []
+            for file in files:
+                if re.search(r'\.zone$', file) and (not file in exclusions):
+                    # This is a zone file, which isn't set to be excluded - parse it
+                    z = Zone(file.replace('.zone', '.'))
+                    z.zone_file = os.path.join(zone_path, file)
+                    try:
+                        z.parse_zone_file()
+                    except IndexError:
+                        print "Problem parsing zone file: %s" % z.zone_file
+                        sys.exit(1)
+                    # Search through the zone's A records for old_ip
+                    for a in z.a:
+                        if re.search(ip + '(\s|$)', a):
+                            zone_hits.append(z)
+                            break
+            # Quit if there are no zones available
+            if len(zone_hits) == 0:
+                print "No zones found with A records resolving to %s." % ip
+                sys.exit(0)
+
+            # Sort our zone_hits list into alphabetical order
+            zone_hits.sort()
+            
+            # We now have a list of zones, display them and ask for confirmation (if not --force)
+            msg = "\nFound %d zones with A records pointing to %s:\n" % (len(zone_hits), ip)
+            msg += (len(msg) - 2) * '=' + "\n"
+            for zone in zone_hits:
+                msg += "  %s (TTL: %s)\n" % (zone.name, zone.soa['ttl'])
+            print msg
+
+            if not options.force:
+                confirmed = False
+            else:
+                confirmed = True
+            confirm_msg = "Change TTL to %s in these zones? (Yes/No): " % ttl
+            while not confirmed:
+                confirmation = raw_input(confirm_msg)
+                if confirmation.lower() == 'yes' or confirmation.lower() == 'y':
+                    confirmed = True
+                elif confirmation.lower() == 'no' or confirmation.lower() == 'n':
+                    if options.verbose:
+                        print "Cancelling TTL change request and exiting."
+                    sys.exit(0)
+                else:
+                    print "You must confirm yes or no (y/yes or n/no)"
+
+            # Update TTL for each zone
+            for z in zone_hits:
+                # Update the TTL settings
+                z.soa['ttl'] = ttl
+                z.soa['minttl'] = ttl
+                # Update the serial
+                z.soa['serial'] = update_serial(z.soa['serial'])
+                # Rebuild the zone file
+                try:
+                    z.write_zone_file(uid, gid)
+                except IOError:
+                    os.system('''echo -e "\E[1;31mUnable to create zone file\033[0m"''')
+                    sys.exit(1)
+             
+            # Copy the zone files to the other nameservers
+            scp_src = ''
+            for z in zone_hits:
+                scp_src += z.zone_file + ' '
+            if len(nameservers) > 0:
+                for ns in nameservers:
+                    scp_comm = '''scp %s root@%s:%s''' % (scp_src, ns, conf.get("bind", "zonefile_path"))
+                    if options.verbose:
+                        print "Copying %d updated zones to %s" % (len(zone_hits), ns)
+                        os.system(scp_comm)
+                    else:
+                        os.system(scp_comm + " >> /dev/null 2<&1")
+
+            # Reload on all nameservers
+            if not options.local_only and options.restart and len(nameservers) > 0:
+                for ns in nameservers:
+                    if options.verbose:
+                        print "Reloading BIND on %s" % ns
+                        ssh_command = conf.get("bind", "restart_command")
+                    else:
+                        ssh_command = conf.get("bind", "restart_command") + " >> /dev/null 2>&1"
+                    os.system('''ssh %s "%s"''' % (ns, ssh_command))
+        else:
+            os.system('''echo -e "\E[1;31mYou must provide a valid TTL time string and a valid IP address\033[0m"''')
+            if valid_ttl == False:
+                print "'%s' is not a valid TTL time string" % ttl
+            if valid_ip == False:
+                print "'%s' is not a valid IP address" % ip
+            sys.exit(2)
+
+
+    ## UNKNOWN COMMAND ##
+    else:
+        os.system('''echo -e "\E[1;31mYou have provided an invalid command\033[0m"''')
+        sys.exit(2)
+    
+    # Restart/reload the BIND service if required    
+    if options.restart:
+        restart(conf.get("bind", "restart_command"), options.verbose)
+
+def arg_number_error(command):
+    # Present the user with a red error message, then exits with status '2' to show
+    # insufficient command arguments.
+    if command == 'add' or command == 'zone':
+        msg = "You must provide a zone name and an IP address to add a zone."
+    elif command == 'edit':
+        msg = "You must provide a zone name for the edit command."
+    elif command == 'edit-ptr':
+        msg = "You must provide an IP address for the edit-ptr command."
+    elif command == 'del' or command == 'delete':
+        msg = "You must provide a zone name to delete."
+    elif command == 'ptr':
+        msg = "You must provide a zone name and an IP address to add a PTR record."
+    elif command == 'sub':
+        msg = "You must provide a subdomain host name, a zone name and an IP address to add a subdomain."
+    elif command == 'a':
+        msg = "You must provide a host name, a zone name and an IP address to add an A record."
+    elif command == 'cname':
+        msg = "You must provide a host name, a zone and a target domain to add a CNAME record."
+    elif command == 'serial':
+        msg = "You must provide a zone name to update that zone's serial."
+    elif command == 'ttl' or command == 'ttl-zone':
+        msg = "You must provide a TTL time string and a zone name to modify the time to live."
+    elif command == 'ip-change':
+        msg = "You must provide two valid IP addresses, the IP to search for and the IP to change to."
+    elif command == 'ttl-ip':
+        msg = "You must provide a valid IP address and a TTL time string."
+    
+    os.system('''echo -e "\E[1;31m%s\033[0m"''' % msg)
+    sys.exit(2)
+
+
+def validate_zone(zone):
+    # do a regular expression check for a valid domain format
+    valid_zone_rgxp = re.compile("^([0-9A-Za-z\-]+\.){1,4}[0-9A-Za-z]+\.$")
+    if valid_zone_rgxp.search(zone):
+        valid = True
+    else:
+        valid = False
+    return valid
+
+
+def validate_ip(ip):
+    # do a regular expression check for a valid IP address format
+    ipRgxp = r"(?:1\d?\d?|2(?:[0-4]\d?|[6789]|5[0-5]?)?|[3-9]\d?|0)(?:\.(?:1\d?\d?|2(?:[0-4]\d?|[6789]|5[0-5]?)?|[3-9]\d?|0)){3}"
+    valid_ip_rgxp = re.compile(ipRgxp)
+    if valid_ip_rgxp.search(ip):
+        valid = True
+    else:
+        valid = False
+    return valid
+
+
+def validate_hostname(host, is_subdomain=False):
+    # Do a regular expression to check for illegal characters
+    if is_subdomain:
+        valid_host_rgxp = re.compile(r"^[0-9a-z\-]+$")
+    else:
+        valid_host_rgxp = re.compile(r"^[0-9a-z\-\.]+$")
+    
+    if valid_host_rgxp.search(host):
+        valid = True
+    elif not is_subdomain and (host == '*' or host == '@'):
+        # Allow for wildcard records.
+        valid = True
+    else:
+        valid = False
+    
+    return valid
+
+
+def validate_preference(pref):
+    # Check that the preference is an integer
+    if not pref.isdigit():
+        valid = False
+    else:
+        pref = int(pref)
+        if pref < 0 or pref > 65535:
+            valid = False
+        else:
+            valid = True
+    
+    return valid
+
+
+def validate_ttl(ttl):
+    # Check that the ttl is in seconds, or matches BINDs time notation.
+    seconds_rgxp = re.compile(r"^[0-9]+$")
+    time_rgxp = re.compile(r"^[0-9]+(m|h|d|w)$")
+    
+    if seconds_rgxp.match(ttl):
+        valid = True
+    elif time_rgxp.match(ttl):
+        valid = True
+    else:
+        valid = False
+    
+    return valid
+
+
+def ip_to_arpa(ip):
+    octets = ip.split('.')
+    arpa_zone = "%s.%s.%s.in-addr.arpa." % (octets[2], octets[1], octets[0])
+    
+    return arpa_zone
+
+
+def restart(restart_command, verbose=None):
+    if verbose:
+        os.system(restart_command)
+    else:
+        os.system(restart_command + " >> /dev/null 2>&1")
+
+
+def update_serial(current_serial):
+    new_serial_date = int(time.strftime("%Y%m%d", time.localtime(time.time())))
+    current_serial_date = int(current_serial[0:-2])
+    
+    if new_serial_date != current_serial_date:
+        updated_serial = str(new_serial_date) + '01'
+    else:
+        # Same date, increment serial by 1
+        new_serial = int(current_serial) + 1
+        updated_serial = str(new_serial)
+    
+    return updated_serial
+
+
+def remove_from_conf(conf_path, zone):
+    "Remove a zone entry from the conf file."
+    # Open the file, read all to a buffer, except this zone. Output buffer to file
+    try:
+        f = open(conf_path, 'r')
+        file_buffer = ''
+        zone_block_start = r'zone\b\s+"'+zone[0:-1]+'"\s+{\s+'
+        zone_block_end = r'\s*}\s*;'
+        in_zone_block = False # a flag to mark when we are in our zone block
+        for line in f:
+            if in_zone_block:
+                # We're in our zone block, continue the loop without adding line
+                if re.search(zone_block_end, line):
+                    # We've just hit the end of the block, change the flag
+                    in_zone_block = False
+            elif re.search(zone_block_start, line):
+                # We're in our zone block, set the flag and continue the loop
+                in_zone_block = True
+            else:
+                file_buffer += line
+        f.close()
+        # Now write our buffer to BIND conf
+        f = open(conf_path, 'w')
+        f.write(file_buffer)
+        f.close()
+    except IOError:
+        os.system('''echo -e "\E[1;31mUnable to open BIND config file\033[0m"''')
+        sys.exit(1)
+
+
+def zone_import(zone_file, options, conf):
+    "Zone import function. Takes path to zone file, options object and conf object as args."
+    
+    print "Importing %s..." % zone_file
+    # We need to assume that the zone name appears in the SOA
+    f = open(zone_file, 'r')
+    # Find the line with 'IN SOA' in it
+    regxp = re.compile(r'\s+IN\s+SOA\s+', re.IGNORECASE)
+    found_name = True
+    for line in f:
+        if regxp.search(line):
+            # This is our first SOA line, we need the first word
+            tokens = line.split()
+            if validate_zone(tokens[0]):
+                # Tokens[0] is our zone name
+                z = Zone(tokens[0])
+            else:
+                # We couldn't figure out the zone name, give up
+                print "Could not determine zone name. Skipping %s" % zone_file
+            break
+    f.close()
+    if not found_name:
+        print "Could not find initial SOA line. Skipping %s" % zone_file
+    else:
+        # We need to modify the SOA
+        z.parse_zone_file(zone_file)
+        # Update the serial.
+        z.soa['serial'] = update_serial(z.soa['serial'])
+        # We want to modify the email and ns SOA entries
+        z.soa['email'] = conf.get("soa_defaults", "email")
+        z.soa['ns'] = conf.get("soa_defaults", "ns1")
+        # Keep the current NS records for the zone only:
+        checked_ns = False
+        while not checked_ns:
+            if len(z.ns) > 0:
+                for x in range(len(z.ns)):
+                    # split the record up
+                    ns_tokens = z.ns[x].split()
+                    # check for ns_tokens[0] being z.name or '@' and remove
+                    if ns_tokens[0] == '@' or ns_tokens[0] == z.name:
+                        del z.ns[x]
+                        # z.ns list has now lost an element, 'x' references are wrong,
+                        # so break out & re-run loop
+                        break
+                    # If we've hit the last item without deleting & breaking, we can
+                    # finish the while loop
+                    if x+1 == len(z.ns):
+                        checked_ns = True
+            else:
+                checked_ns = True
+        
+        z.add_default_records('NS')
+        
+        # Recreate the zone file
+        z.zone_file = os.path.join(conf.get("bind", "zonefile_path"), conf.get("bind", "zonefile_format").replace('%', z.name[0:-1]))
+        uid = int(pwd.getpwnam(conf.get("bind", "uid"))[2])
+        gid = int(grp.getgrnam(conf.get("bind", "gid"))[2])
+        try:
+            z.write_zone_file(uid, gid)
+        except IOError:
+            os.system('''echo -e "\E[1;31mUnable to create zone file\033[0m"''')
+            sys.exit(1)
+            
+        # Write to conf
+        # Set up BIND config entry.
+        z.conf_entry = "zone \"%s\" {\n\ttype master;\n\tfile \"%s\";\n};" \
+                        % (z.name[0:-1], conf.get("bind", "zonefile_format").replace('%', z.name[0:-1]))
+        try:
+            conf_written = z.write_to_conf(conf.get("bind", "conf_path"))
+        except IOError:
+            os.system('''echo -e "\E[1;31mUnable to open BIND config file\033[0m"''')
+            sys.exit(1)
+        
+        if not options.local_only:
+            # Copy this zone file to the other nameservers
+            nameservers = conf.get('nameservers', 'ns').split(',')
+            for ns in nameservers:
+                scp_comm = '''scp %s root@%s:%s''' % (z.zone_file, ns, z.zone_file)
+                ssh_comm = '''chown %s:%s %s; ''' % (uid, gid, z.zone_file)
+                ssh_comm = ssh_comm + '''dnsadmin --local-only conf %s''' % z.name
+                if not options.restart:
+                    ssh_comm = ssh_comm + ' --no-restart'
+                if options.verbose:
+                    ssh_comm = ssh_comm + ' --verbose'
+                if options.verbose:
+                    print "Copying zone to %s" % ns
+                    os.system(scp_comm)
+                else:
+                    os.system(scp_comm + " >> /dev/null 2<&1")
+                # We need to make sure we have correct ownerships on the copied zones
+                # and we need to run the 'conf' command
+                os.system('''ssh %s "%s"''' % (ns, ssh_comm))
+
+    
+if __name__ == "__main__":
+    main()
