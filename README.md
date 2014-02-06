@@ -1,4 +1,5 @@
-== dnsadmin
+dnsadmin
+========
 
 dnsadmin is a command line script used to create and manipulate BIND zones
 and configuration files.
@@ -6,7 +7,8 @@ and configuration files.
 It needs to be installed on all nameservers in a nameserver cluster, which all
 need to have SSH running.
 
-== Installation
+Installation
+============
 Clone the repo, then do the following:
  - copy dnsadmin.conf and recordtemplates.py to /etc/dnsadmin/
  - copy dnsadmin to /usr/local/bin and make sure it is executable
@@ -16,4 +18,4 @@ Clone the repo, then do the following:
  - edit the /etc/dnsadmin/dnsadmin.conf and /etc/dnsadmin/recordtemplates.py
    files as appropriate for your setup
 
-Then run dnsadmin --help for usage instructions.
+Then run `dnsadmin --help` for usage instructions.
