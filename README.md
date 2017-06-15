@@ -10,12 +10,12 @@ need to have SSH running.
 Installation
 ============
 Clone the repo, then do the following:
- - copy dnsadmin.conf and recordtemplates.py to /etc/dnsadmin/
- - copy dnsadmin to /usr/local/bin and make sure it is executable
- - copy zone.py to your Python lib dir (/usr/lib/python2.4/site-packages/
+ - copy `dnsadmin.conf` and `recordtemplates.py` to `/etc/dnsadmin/`
+ - copy `dnsadmin` to `/usr/local/bin` and make sure it is executable
+ - copy `zone.py` to your Python lib dir (`/usr/lib/python2.4/site-packages/`
    on a RHEL/CentOS 5 system)
- - create a symlink in your Python lib dir back to /etc/dnsadmin/recordtemplates.py
- - edit the /etc/dnsadmin/dnsadmin.conf and /etc/dnsadmin/recordtemplates.py
+ - create a symlink in your Python lib dir back to `/etc/dnsadmin/recordtemplates.py`
+ - edit the `/etc/dnsadmin/dnsadmin.conf` and `/etc/dnsadmin/recordtemplates.py`
    files as appropriate for your setup
 
 Then run `dnsadmin --help` for usage instructions.
